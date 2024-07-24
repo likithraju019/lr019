@@ -1,0 +1,187 @@
+# 1. Base Installations
+apt-get -y update && apt-get -y upgrade
+apt-get install -y \
+  ruby-rubygems\
+  git-core \
+  git-svn \
+  ruby \
+  subversion \
+  curl \
+  python3-pip\
+  xmlstarlet\
+  gh # GitHub CLI
+gem install svn2git
+pip install pandas
+pip install lxml
+pip install openpyxl
+
+## Exports
+SVN_REPO_URL= SVN_URL
+SVN_REPO_NAME= Repo_Name
+JFROG_ARTIFACTORY= Artifactory_Name
+JFROG_ARTIFACTORY_REPO=demo-generic-local
+GITHUB_REPO=svn-gh-test
+GITHUB_HOST=https://www.github.com
+GITHUB_ORG=StatusNeo
+
+## Pre-Reqs
+git config --global user.name "CSG_Bot"
+git config --global user.email "bot@csg.com"
+git config --global init.defaultBranch main
+
+# 2. Create User Mapping
+svn log ${SVN_REPO_URL} -q | awk -F '|' '/^r/ {gsub(/ /, "", $2); sub(" $", "", $2); print $2" = "$2" <"$2">"}' | sort -u > users.txt
+
+# 3. Clone SVN repo & Initialize as Git Repository
+git svn clone --stdlayout --authors-file=users.txt ${SVN_REPO_URL}
+cd ${SVN_REPO_NAME}
+git branch -a >doc.txt
+ 
+ 
+-----------
+ 
+while IFS= read -r tag; do
+  tag=$(echo "$tag" | tr -d '[:space:]')
+ 
+  if [[ $tag == remotes/origin/tags/* ]]; then
+    tag_name=$(basename "$tag") 
+    f_tag=origin/tags/"$tag_name"
+ 
+    git tag "$tag_name" "$f_tag" 
+  fi
+done < doc.txt
+ 
+-----------
+ 
+ 
+ 
+ 
+while IFS= read -r branch; do
+  branch=$(echo "$branch" | tr -d '[:space:]')
+ 
+  branch_name=$(echo "$branch" | sed 's|^remotes/origin/||')
+  if [[ $branch == remotes/origin/tags/* || $branch == remotes/origin/trunk* ]]; then
+    continue
+  fi
+  git checkout -b "$branch_name" "$branch"
+done < doc.txt
+ 
+-----------
+ 
+ 
+ 
+-----------
+while IFS= read -r label; do
+  # Remove leading and trailing whitespace from label
+  label=$(echo "$label" | tr -d '[:space:]')
+ 
+  # Modify label to remove 'remotes/' prefix
+  label=$(echo "$label" | sed 's|^remotes/||')
+ 
+  # Delete the remote branch
+  git branch -D -r "$label"
+ 
+  echo "Deleted remote branch: $label"
+done < doc.txt
+ 
+while IFS= read -r branch; do
+  branch=$(echo "$branch" | tr -d '[:space:]')
+  branch=${branch#\*}
+  if [[ $branch == master ]]; then
+    path="$SVN_REPO_URL/trunk"
+  else
+    path="$SVN_REPO_URL/branches/$branch"
+  fi
+find . -type f ! -path "*/.git/*" | while IFS= read -r file; do
+    mime_type=$(file --mime-type -b "$file")
+    case "$mime_type" in
+      application/octet-stream|application/x-dosexec|application/x-dfont)
+        binary_name=$(basename "$file")
+        # Get the absolute path of the binary
+        binary_path=$(realpath "$file")
+        jfrog_url="${JFROG_ARTIFACTORY}/artifactory/${JFROG_ARTIFACTORY_REPO}"
+        svn_url="$path/${file#./}"
+        svn_info=$(svn log --xml "$svn_url" )
+        commit_date=$(echo "$svn_info" | xmlstarlet sel -t -v "//logentry/date" -n)
+        commit_d10="${commit_date:0:10}"
+        # Debug: Output paths to verify they are correct
+        echo "Debug: binary_name = $binary_name"
+        echo "Debug: binary_path = $binary_path"
+        echo "Debug: jfrog_url = $jfrog_url"
+
+        # Add verbose output to curl for debugging
+        if ! curl Name:Pass --upload-file "$binary_path" "$jfrog_url/$commit_d10-$binary_name"; then
+            echo "Failed to upload $binary_path to JFrog" >&2
+     echo "$binary_path" >> failed_bin.txt
+            continue
+        fi
+        echo "$binary_path || $jfrog_url/$commit_d10-$binary_name" >> final_bin_list.txt
+        ;;
+    esac
+done
+done < BranchList.txt
+-----------
+while IFS= read -r branch; do
+  branch=$(echo "$branch" | tr -d '[:space:]')
+  if [[ $branch == master ]]; then
+    path="$SVN_REPO_URL/trunk"
+  else
+    path="$SVN_REPO_URL/branches/$branch"
+  fi
+  # Process each file in the current directory
+  find . -type f ! -path "*/.git/*" | while IFS= read -r file; do
+    mime_type=$(file --mime-type -b "$file")
+    case "$mime_type" in
+      application/octet-stream|application/x-dosexec|application/x-dfont)
+        # Extract binary file name and path
+        binary_name=$(basename "$file")
+        binary_path=$(realpath "$file")
+        # Construct JFrog Artifactory URL
+        jfrog_url="${JFROG_ARTIFACTORY}/artifactory/${JFROG_ARTIFACTORY_REPO}/$binary_name"
+        # Check if binary file path matches stored path in final_bin_list.txt
+        while IFS= read -r line; do
+          stored_path=$(echo "$line" | cut -d '|' -f1,2 | tr -d '[:space:]' | tr -d '|')
+          jfrog=$(echo "$line" | cut -d '|' -f3 | tr -d '[:space:]')
+          if [[ "$binary_path" == "$stored_path" ]]; then
+            jfrog_url="$jfrog"
+          fi
+        done < final_bin_list.txt
+        # Write JFrog Artifactory URL to .url file
+        echo "$jfrog_url" > "${file}.url"
+        # Construct SVN URL for the file
+        svn_url="$path/${file#./}"
+        # Check if SVN log is accessible
+        svn_info=$(svn log --xml "$svn_url" )
+        # Check if SVN log retrieval was successful
+        if [[ $? -ne 0 ]]; then
+          echo "Error retrieving SVN log for $svn_url"
+          echo "$svn_url" >> Bins_Nohistory.txt
+          commit_date=$avgDate  # Assuming avgDate is predefined
+          commit_author=Csg_Bot
+          commit_msg="Migrated By StatusNeo ( No Data Available in SVN Repo )"
+          continue
+        else
+          # Extract commit information from SVN log
+          commit_author=$(echo "$svn_info" | xmlstarlet sel -t -v "//logentry/author" -n)
+          commit_date=$(echo "$svn_info" | xmlstarlet sel -t -v "//logentry/date" -n)
+          commit_msg=$(echo "$svn_info" | xmlstarlet sel -t -v "//logentry/msg" -n)
+        fi
+        # Set git environment variables for commit
+        export GIT_AUTHOR_NAME="$commit_author"
+        export GIT_AUTHOR_EMAIL="${commit_author}@cloud.com"
+        export GIT_AUTHOR_DATE="$commit_date"
+        export GIT_COMMITTER_NAME="$commit_author"
+        export GIT_COMMITTER_EMAIL="${commit_author}@cloud.com"
+        export GIT_COMMITTER_DATE="$commit_date"
+        # Commit the .url file with the original commit date
+        git add "${file}.url"
+        git commit -m "$commit_msg"
+        # Get the size of the binary file
+        binary_size=$(stat -c%s "$file")
+        echo "$jfrog_url, $binary_size bytes" >> binary_urls.txt
+        # Add the size to the total size
+        total_size=$((total_size + binary_size))
+        ;;
+    esac
+  done
+done < BranchList.txt
